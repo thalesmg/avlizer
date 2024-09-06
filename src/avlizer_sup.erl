@@ -30,7 +30,8 @@ start_link() ->
   supervisor:start_link({local, ?SUP}, ?MODULE, []).
 
 init(_) ->
-  Children = [avlizer_confluent()],
+  %% Requires setting configs in application env
+  Children = [avlizer_confluent() || is_env_configured()],
   {ok, {{one_for_one, 5, 10}, Children}}.
 
 %%%_* Internals ================================================================
@@ -43,6 +44,14 @@ avlizer_confluent() ->
   , _Type     = worker
   , _Module   = [avlizer_confluent]
   }.
+
+is_env_configured() ->
+  case application:get_env(?APPLICATION, avlizer_confluent) of
+    #{schema_registry_url := _} ->
+      true;
+    _ ->
+      false
+  end.
 
 %%%_* Emacs ====================================================================
 %%% Local Variables:

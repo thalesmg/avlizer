@@ -53,7 +53,9 @@
         ]).
 
 -export([ start_link/0
+        , start_link/2
         , stop/0
+        , stop/1
         ]).
 
 -export([ decode/1
@@ -65,19 +67,28 @@
         , make_decoder/1
         , make_decoder/2
         , make_decoder/3
+        , make_decoder2/3
+        , make_decoder2/4
         , make_encoder/1
         , make_encoder/2
+        , make_encoder2/3
         , get_decoder/1
         , get_decoder/2
         , get_decoder/3
         , get_encoder/1
         , get_encoder/2
         , maybe_download/1
+        , maybe_download/3
         , register_schema/2
+        , register_schema/3
         , register_schema_with_fp/2
         , register_schema_with_fp/3
+        , register_schema_with_fp/5
         , tag_data/2
         , untag_data/1
+        ]).
+
+-export([ get_table/1
         ]).
 
 -export_type([ regid/0
@@ -103,6 +114,18 @@
 -type ref() :: regid() | {name(), fp()}.
 -type codec_options() :: avro:codec_options().
 
+-type auth() :: {basic, _Username :: string(), _Password :: string()}.
+-type init_opts() :: #{
+    url => string(),
+    auth => auth(),
+    table_name => atom()
+}.
+-type state() :: #{
+    table := ets:table(),
+    url := string(),
+    auth := auth() | nil()
+}.
+
 -define(ASSIGNED_NAME, <<"_avlizer_assigned">>).
 -define(LKUP(Ref), fun(?ASSIGNED_NAME) -> ?MODULE:maybe_download(Ref) end).
 
@@ -113,12 +136,26 @@
 %% Schema registry URL is configured in app env.
 -spec start_link() -> {ok, pid()} | {error, any()}.
 start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+  start_link({local, ?SERVER}, #{table_name => ?CACHE}).
+
+-spec start_link(gen_server:server_ref() | undefined, init_opts()) -> {ok, pid()} | {error, any()}.
+start_link(_ServerRef = undefined, InitOpts) ->
+  gen_server:start_link(?MODULE, InitOpts, []);
+start_link(ServerRef, InitOpts) ->
+  gen_server:start_link(ServerRef, ?MODULE, InitOpts, []).
 
 %% @doc Stop the gen_server, mostly used for tets.
 -spec stop() -> ok.
 stop() ->
-  ok = gen_server:call(?SERVER, stop).
+  stop(?SERVER).
+
+-spec stop(gen_server:server_ref()) -> ok.
+stop(ServerRef) ->
+  ok = gen_server:call(ServerRef, stop).
+
+-spec get_table(gen_server:server_ref()) -> ets:table().
+get_table(ServerRef) ->
+  gen_server:call(ServerRef, get_table, infinity).
 
 %% @doc Make an avro decoder from the given schema reference.
 %% This call has an overhead of ets lookup (and maybe a `gen_server'
@@ -131,23 +168,29 @@ stop() ->
 %% number (or a stream) of objects having the same reference.
 -spec make_decoder(ref()) -> avro:simple_decoder().
 make_decoder(Ref) ->
-  do_make_decoder(Ref, ?DEFAULT_CODEC_OPTIONS).
+  do_make_decoder(?SERVER, ?CACHE, Ref, ?DEFAULT_CODEC_OPTIONS).
 
 -spec make_decoder(ref(), codec_options()) -> avro:simple_decoder();
                   (name(), fp()) -> avro:simple_decoder().
 make_decoder(Ref, CodecOptions) when ?IS_REF(Ref) ->
-  do_make_decoder(Ref, CodecOptions);
+  do_make_decoder(?SERVER, ?CACHE, Ref, CodecOptions);
 make_decoder(Name, Fp) ->
-  do_make_decoder({Name, Fp}, ?DEFAULT_CODEC_OPTIONS).
+  do_make_decoder(?SERVER, ?CACHE, {Name, Fp}, ?DEFAULT_CODEC_OPTIONS).
 
 -spec make_decoder(name(), fp(), codec_options()) -> avro:simple_decoder().
 make_decoder(Name, Fp, CodecOptions) ->
-  do_make_decoder({Name, Fp}, CodecOptions).
+  do_make_decoder(?SERVER, ?CACHE, {Name, Fp}, CodecOptions).
 
--spec do_make_decoder(ref(), codec_options()) -> avro:simple_decoder().
-do_make_decoder(Ref, CodecOptions) ->
-  Schema = maybe_download(Ref),
+-spec do_make_decoder(gen_server:server_ref(), ets:table(), ref(), codec_options()) -> avro:simple_decoder().
+do_make_decoder(ServerRef, Table, Ref, CodecOptions) ->
+  Schema = maybe_download(ServerRef, Table, Ref),
   avro:make_simple_decoder(Schema, CodecOptions).
+
+make_decoder2(ServerRef, Table, Ref) ->
+  make_decoder2(ServerRef, Table, Ref, ?DEFAULT_CODEC_OPTIONS).
+
+make_decoder2(ServerRef, Table, Ref, CodecOptions) ->
+  do_make_decoder(ServerRef, Table, Ref, CodecOptions).
 
 %% @doc Make an avro encoder from the given schema reference.
 %% This call has an overhead of ets lookup (and maybe a `gen_server'
@@ -160,11 +203,15 @@ do_make_decoder(Ref, CodecOptions) ->
 %% number of objects in a tight loop.
 -spec make_encoder(ref()) -> avro:simple_encoder().
 make_encoder(Ref) ->
-  Schema = maybe_download(Ref),
+  make_encoder2(?SERVER, ?CACHE, Ref).
+
+-spec make_encoder2(gen_server:server_ref(), ets:table(), ref()) -> avro:simple_encoder().
+make_encoder2(ServerRef, Table, Ref) ->
+  Schema = maybe_download(ServerRef, Table, Ref),
   avro:make_simple_encoder(Schema, []).
 
 -spec make_encoder(name(), fp()) -> avro:simple_encoder().
-make_encoder(Name, Fp) -> make_encoder({Name, Fp}).
+make_encoder(Name, Fp) -> make_encoder2(?SERVER, ?CACHE, {Name, Fp}).
 
 %% @doc Get avro decoder by lookup already decoded avro schema
 %% from cache, and make a decoder from it.
@@ -203,9 +250,13 @@ get_encoder(Name, Fp) -> get_encoder({Name, Fp}).
 %% @doc Lookup cache for decoded schema, try to download if not found.
 -spec maybe_download(ref()) -> avro:avro_type().
 maybe_download(Ref) ->
-  case lookup_cache(Ref) of
+  maybe_download(?SERVER, ?CACHE, Ref).
+
+-spec maybe_download(gen_server:server_ref(), ets:table(), ref()) -> avro:avro_type().
+maybe_download(Server, Table, Ref) ->
+  case lookup_cache(Table, Ref) of
     false ->
-      case download(Ref) of
+      case download(Server, Ref) of
         {ok, Type} ->
           Type;
         {error, Reason} ->
@@ -218,11 +269,16 @@ maybe_download(Ref) ->
 %% @doc Register a schema.
 -spec register_schema(string(), binary() | avro:avro_type()) ->
         {ok, regid()} | {error, any()}.
-register_schema(Subject, JSON) when is_binary(JSON) ->
-  do_register_schema(Subject, JSON);
-register_schema(Subject, Schema) ->
+register_schema(Subject, JSONOrSchema) ->
+  register_schema(undefined, Subject, JSONOrSchema).
+
+-spec register_schema(gen_server:server_ref() | undefined, string(), binary() | avro:avro_type()) ->
+        {ok, regid()} | {error, any()}.
+register_schema(MServerRef, Subject, JSON) when is_binary(JSON) ->
+  do_register_schema(MServerRef, Subject, JSON);
+register_schema(MServerRef, Subject, Schema) ->
   JSON = avro:encode_schema(Schema),
-  register_schema(Subject, JSON).
+  register_schema(MServerRef, Subject, JSON).
 
 %% @doc Register schema with name + fingerprint.
 %% crc64 fingerprint is returned.
@@ -245,15 +301,22 @@ register_schema_with_fp(Name, Schema) ->
 -spec register_schema_with_fp(string() | binary(), fp(),
                               binary() | avro:avro_type()) ->
         ok | {error, any()}.
-register_schema_with_fp(Name, Fp, JSON) when is_binary(JSON) ->
+register_schema_with_fp(Name, Fp, JSONOrSchema) ->
+  register_schema_with_fp(undefined, ?CACHE, Name, Fp, JSONOrSchema).
+
+-spec register_schema_with_fp(gen_server:server_ref() | undefined, ets:table(),
+                              string() | binary(), fp(),
+                              binary() | avro:avro_type()) ->
+        ok | {error, any()}.
+register_schema_with_fp(MServerRef, Table, Name, Fp, JSON) when is_binary(JSON) ->
   Ref = unify_ref({Name, Fp}),
   DoIt = fun() ->
-             case do_register_schema(Ref, JSON) of
+             case do_register_schema(MServerRef, Ref, JSON) of
                {ok, _RegId} -> ok;
                {error, Rsn} -> {error, Rsn}
              end
          end,
-  try lookup_cache(Ref) of
+  try lookup_cache(Table, Ref) of
     {ok, _} -> ok; %% found in cache
     false -> DoIt()
   catch
@@ -261,9 +324,9 @@ register_schema_with_fp(Name, Fp, JSON) when is_binary(JSON) ->
       %% no ets
       DoIt()
   end;
-register_schema_with_fp(Name, Fp, Schema) ->
+register_schema_with_fp(MServerRef, Table, Name, Fp, Schema) ->
   JSON = avro:encode_schema(Schema),
-  register_schema_with_fp(Name, Fp, JSON).
+  register_schema_with_fp(MServerRef, Table, Name, Fp, JSON).
 
 %% @doc Tag binary data with schema registration ID.
 -spec tag_data(regid(), binary()) -> binary().
@@ -319,11 +382,22 @@ encode(Name, Fp, Input) -> encode({Name, Fp}, Input).
 
 %%%_* gen_server callbacks =====================================================
 
-init(_) ->
-  ets:new(?CACHE, [named_table, protected, {read_concurrency, true}]),
+-spec init(init_opts()) -> {ok, state()}.
+init(Opts) ->
   %% fail fast for bad config
-  _ = get_registry_base_request(),
-  {ok, #{}}.
+  {URL, Auth} = get_init_config(Opts),
+  ETSOpts0 = [protected, {read_concurrency, true}],
+  ETSOpts =
+    case Opts of
+      #{table_name := _} ->
+        [named_table | ETSOpts0];
+      _ ->
+        ETSOpts0
+    end,
+  Table = maps:get(table_name, Opts, ?CACHE),
+  TId = ets:new(Table, ETSOpts),
+  State = #{table => TId, url => URL, auth => Auth},
+  {ok, State}.
 
 handle_info(Info, State) ->
   error_logger:error_msg("~p: Unknown info: ~p", [?MODULE, Info]),
@@ -336,8 +410,14 @@ handle_cast(Cast, State) ->
 handle_call(stop, _From, State) ->
   {stop, normal, ok, State};
 handle_call({download, Ref}, _From, State) ->
-  Result = handle_download(Ref),
+  Result = handle_download(State, Ref),
   {reply, Result, State};
+handle_call(get_table, _From, State) ->
+  #{table := TId} = State,
+  {reply, TId, State};
+handle_call(get_registry_base_request, _From, State) ->
+  Reply = get_registry_base_request_from_state(State),
+  {reply, Reply, State};
 handle_call(Call, _From, State) ->
   {reply, {error, {unknown_call, Call}}, State}.
 
@@ -349,7 +429,29 @@ terminate(_Reason, _State) ->
 
 %%%_* Internals ================================================================
 
-get_registry_base_request() ->
+get_registry_base_request(_ServerRef = undefined) ->
+  get_registry_base_request_from_env();
+get_registry_base_request(ServerRef) ->
+  gen_server:call(ServerRef, get_registry_base_request, infinity).
+
+get_registry_base_request_from_state(State) ->
+  #{url := URL, auth := Auth} = State,
+  {URL, Auth}.
+
+get_registry_base_request_from_env() ->
+  get_config_from_env().
+
+get_init_config(InitOpts) ->
+  case InitOpts of
+    #{url := URL, auth := Auth} ->
+      {URL, [get_registry_auth(Auth)]};
+    #{url := URL} ->
+      {URL, []};
+    _ ->
+      get_config_from_env()
+  end.
+
+get_config_from_env() ->
   {ok, Cfg} = application:get_env(?APPLICATION, ?MODULE),
   URL = maps:get(schema_registry_url, Cfg),
   case maps:get(schema_registry_auth, Cfg, false) of
@@ -358,41 +460,55 @@ get_registry_base_request() ->
   end.
 
 get_registry_auth({basic, Username, Password}) ->
-  {"Authorization", "Basic " ++ base64:encode_to_string(Username ++ ":" ++ Password)}.
+  {"Authorization", "Basic " ++ base64:encode_to_string(Username ++ ":" ++ unwrap_password(Password))}.
 
-download(Ref) ->
-  gen_server:call(?SERVER, {download, Ref}, infinity).
+unwrap_password(X) ->
+  Y = unwrap(X),
+  str(Y).
 
-handle_download(Ref) ->
+unwrap(Fun) when is_function(Fun, 0) ->
+  unwrap(Fun());
+unwrap(X) ->
+  X.
+
+str(B) when is_binary(B) -> binary_to_list(B);
+str(S) when is_list(S) -> S.
+
+download(Server, Ref) ->
+  gen_server:call(Server, {download, Ref}, infinity).
+
+handle_download(State, Ref) ->
+  #{table := Table} = State,
   %% lookup again to avoid concurrent callers re-download
-  case lookup_cache(Ref) of
+  case lookup_cache(Table, Ref) of
     {ok, Schema} ->
       {ok, Schema};
     false ->
-      SchemaRegistryBaseRequest = get_registry_base_request(),
+      SchemaRegistryBaseRequest = get_registry_base_request_from_state(State),
       case do_download(SchemaRegistryBaseRequest, Ref) of
         {ok, JSON} ->
-          Schema = decode_and_insert_cache(Ref, JSON),
+          Schema = decode_and_insert_cache(State, Ref, JSON),
           {ok, Schema};
         Error ->
           Error
       end
   end.
 
-decode_and_insert_cache(Ref, JSON) ->
+decode_and_insert_cache(State, Ref, JSON) ->
   AvroType = avro:decode_schema(JSON),
   Lkup = avro:make_lkup_fun(AvroType),
   Schema = avro:expand_type_bloated(AvroType, Lkup),
-  ok = insert_cache(Ref, Schema),
+  ok = insert_cache(State, Ref, Schema),
   Schema.
 
-insert_cache(Ref, Schema) ->
-  ets:insert(?CACHE, {unify_ref(Ref), Schema}),
+insert_cache(State, Ref, Schema) ->
+  #{table := Table} = State,
+  ets:insert(Table, {unify_ref(Ref), Schema}),
   ok.
 
-lookup_cache(Ref0) ->
+lookup_cache(Table, Ref0) ->
   Ref = unify_ref(Ref0),
-  case ets:lookup(?CACHE, Ref) of
+  case ets:lookup(Table, Ref) of
     [] -> false;
     [{Ref, Schema}] -> {ok, Schema}
   end.
@@ -434,13 +550,13 @@ httpc_download({SchemaRegistryURL, SchemaRegistryHeaders}) ->
 %% curl -X POST -H "Content-Type: application/vnd.schemaregistry.v1+json" \
 %%      --data '{"schema": "{\"type\": \"string\"}"}' \
 %%      http://localhost:8081/subjects/com.example.name/versions
--spec do_register_schema(string(), binary()) ->
+-spec do_register_schema(gen_server:server_ref() | undefined, string(), binary()) ->
         {ok, regid()} | {error, any()}.
-do_register_schema({Name, Fp}, SchemaJSON) ->
+do_register_schema(MServerRef, {Name, Fp}, SchemaJSON) ->
   Subject = fp_to_subject(Name, Fp),
-  do_register_schema(Subject, SchemaJSON);
-do_register_schema(Subject, SchemaJSON) ->
-  {SchemaRegistryURL, SchemaRegistryHeaders} = get_registry_base_request(),
+  do_register_schema(MServerRef, Subject, SchemaJSON);
+do_register_schema(MServerRef, Subject, SchemaJSON) ->
+  {SchemaRegistryURL, SchemaRegistryHeaders} = get_registry_base_request(MServerRef),
   URL = SchemaRegistryURL ++ "/subjects/" ++ Subject ++ "/versions",
   Body = make_schema_reg_req_body(SchemaJSON),
   Req = {URL, SchemaRegistryHeaders, "application/vnd.schemaregistry.v1+json", Body},
