@@ -30,7 +30,9 @@ start_link() ->
   supervisor:start_link({local, ?SUP}, ?MODULE, []).
 
 init(_) ->
-  Children = [avlizer_confluent()],
+  %% Requires setting configs in application env
+  %% Children = [avlizer_confluent()],
+  Children = [],
   {ok, {{one_for_one, 5, 10}, Children}}.
 
 %%%_* Internals ================================================================
